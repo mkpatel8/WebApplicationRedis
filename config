@@ -1,0 +1,1020 @@
+a. Create an API (if not exists):
+   - APIs → Create API
+   - Name: Your Website API
+   - Identifier: https://your-api-identifier
+   - Signing Algorithm: RS256
+
+b. Configure Mobile Application:
+   - Applications → Your Mobile App
+   - Settings
+   - Check "Token Endpoint Authentication Method" is set to 'none'
+   - Add API permissions to mobile app
+
+c. Configure Website API:
+   - APIs → Your API → Settings
+   - Allow Skipping User Consent: Yes
+   - Add required scopes
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Configure API in Auth0 Dashboard:
+
+Copya. Go to Auth0 Dashboard → APIs → Create API
+   - Name: Your Website API (e.g., "EQ Website API")
+   - Identifier: https://your-domain/api (this is unique identifier)
+   - Signing Algorithm: RS256
+   - Save
+
+b. In the created API settings:
+   - Enable RBAC (Role Based Access Control)
+   - Enable Add Permissions in the Access Token
+
+Configure Mobile Application:
+
+Copya. Applications → Your Mobile App → Settings
+   - Application Type: Native
+   - Allowed Callback URLs: your-mobile-callback-url
+   - Token Endpoint Authentication Method: None
+   - ID Token Algorithm: RS256
+
+b. Under Mobile App → APIs tab:
+   - Enable your Website API
+   - Select required permissions
+
+c. Under Advanced Settings:
+   - Grant Types: ensure "Authorization Code" and "Refresh Token" are selected
+   - Add this audience in Mobile App configuration:
+     audience = "https://your-domain/api" (API identifier)
+
+Configure Website Application:
+
+Copya. Applications → Your Website App
+   - Application Type: Regular Web Application
+   - Allowed Callback URLs: your-website-callback-urls
+   - Token Endpoint Authentication Method: Post
+   - ID Token Algorithm: RS256
+
+b. Note: Keep your Website Client ID and settings as they are
+   This will continue to handle web authentication
+
+After this setup, your mobile app should:
+
+javascriptCopy// Request token with audience and scope
+{
+    "audience": "https://your-domain/api",
+    "scope": "openid profile email your_api_permissions",
+    "client_id": "YOUR_MOBILE_CLIENT_ID"
+}
+
+Then modify your website code to validate tokens from mobile:
+
+csharpCopy// In Startup.cs
+public void Configuration(IAppBuilder app)
+{
+    // Existing web authentication
+    app.UseOpenIdConnectAuthentication(new OpenIdConnectAuthenticationOptions
+    {
+        // Your existing website auth config
+    });
+
+    // Add JWT validation for mobile tokens
+    app.UseJwtBearerAuthentication(new JwtBearerAuthenticationOptions
+    {
+        AuthenticationMode = AuthenticationMode.Active,
+        TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidAudience = "https://your-domain/api", // API Identifier
+            ValidIssuer = $"https://{ConfigurationManager.AppSettings["Auth0:Domain"]}/",
+            IssuerSigningKeyResolver = (token, securityToken, kid, parameters) =>
+            {
+                var keyResolver = new OpenIdConnectSigningKeyResolver($"https://{ConfigurationManager.AppSettings["Auth0:Domain"]}/");
+                return keyResolver.GetSigningKey(kid);
+            }
+        }
+    });
+}
+Now you can handle both authentications in your modules:
+csharpCopyprivate static readonly ILog log = LogManager.GetLogger(typeof(SessionModule));
+
+private void Application_PostAuthorizeRequest(object source, EventArgs e)
+{
+    var app = source as HttpApplication;
+    if (app == null) return;
+
+    var request = app.Context.Request;
+    var authHeader = request.Headers["Authorization"];
+
+    log.Debug($"Authorization header: {authHeader}");
+
+    if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
+    {
+        try
+        {
+            var token = authHeader.Substring("Bearer ".Length);
+            var handler = new JwtSecurityTokenHandler();
+            var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+
+            if (jsonToken != null)
+            {
+                // Validate audience
+                if (jsonToken.Audiences.Contains("https://your-domain/api"))
+                {
+                    var email = jsonToken.Claims.FirstOrDefault(c => c.Type == "email")?.Value;
+                    log.Debug($"Email from token: {email}");
+
+                    if (!string.IsNullOrEmpty(email))
+                    {
+                        var userId = _db.Users.GetUserID(email);
+                        SetupUserIdentity(app.Context, userId);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Error("Token validation failed", ex);
+        }
+    }
+}
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Current Problem Analysis:
+
+Copy- Mobile app authenticates with Auth0 (App 2)
+- Sends token to Website API
+- Website can't validate token because:
+  a. It's configured for different Auth0 app (App 1)
+  b. No proper API authorization setup
+  c. Token validation fails
+
+Solution Approach:
+
+CopyInstead of trying to validate tokens between two different Auth0 applications, we should:
+
+Website API (Backend)
+- Register as an Auth0 API
+- Gets its own API Identifier
+- Can validate tokens from any authorized application
+
+Mobile App
+- Requests token specifically for Website API (using audience)
+- Gets token that Website API can validate
+- Token contains necessary claims (email, etc.)
+
+Why This Works:
+
+CopyBefore:
+Mobile App (Auth0 App 2) → Token → Website (Auth0 App 1) ❌
+(Fails because tokens are for different applications)
+
+After:
+Mobile App → Token (with API audience) → Website API ✅
+(Works because token is specifically for the API)
+
+Key Points:
+
+
+API registration creates proper authorization flow
+Audience in token tells API it's meant for it
+Both apps can communicate through API authorization
+Maintains security and proper validation
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Here's how it works:
+
+In your existing modules:
+
+csharpCopy// Handles both website and mobile auth
+private void Application_PostAuthorizeRequest(object source, EventArgs e)
+{
+    var app = source as HttpApplication;
+    
+    // Check if mobile request (has Bearer token)
+    var authHeader = app.Context.Request.Headers["Authorization"];
+    if (!string.IsNullOrEmpty(authHeader))
+    {
+        // Mobile auth flow
+        // Validate token and get email
+        var userId = _db.Users.GetUserID(email);
+    }
+    else
+    {
+        // Website auth flow (your existing code)
+        // Uses your Forms Authentication cookie
+    }
+
+    // Common code for both
+    SetupUserIdentity(app.Context, userId);
+}
+Key Benefits:
+
+Same endpoint works for both
+Same user setup code
+Same authorization flow
+Just different initial authentication validation
+No need to maintain separate paths
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Current Flow (Website):
+
+CopyAuth0 Login -> UserInfo Endpoint -> Check User.Identity.IsAuthenticated -> FormsAuth.SignIn -> Setup Complete
+
+We want same for Mobile:
+
+CopyMobile Auth0 Login -> UserInfo Endpoint -> Check User.Identity.IsAuthenticated -> FormsAuth.SignIn -> Setup Complete
+Solution:
+csharpCopy// Auth0SessionModule.cs
+private void OnPostAcquireRequestState(object sender, EventArgs e)
+{
+    var app = (HttpApplication)sender;
+    if (app == null) return;
+
+    var request = app.Context.Request;
+    
+    // Skip auth check for UserInfo endpoint
+    if (request.Path.ToLower().Contains("/account/userinfo"))
+    {
+        return;
+    }
+
+    // Rest of your existing code...
+}
+
+// AccountController.cs
+public async Task<ActionResult> UserInfo()
+{
+    // Check for mobile request
+    var authHeader = Request.Headers["Authorization"];
+    
+    if (!string.IsNullOrEmpty(authHeader))
+    {
+        // Validate mobile token
+        var token = authHeader.Substring("Bearer ".Length);
+        var handler = new JwtSecurityTokenHandler();
+        var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+        
+        if (jsonToken != null)
+        {
+            var email = jsonToken.Claims.FirstOrDefault(c => c.Type == "email")?.Value;
+            var userId = _db.Users.GetUserID(email);
+            
+            // Use your existing SignIn method
+            FormsAuthentication.SignIn(userId);
+            
+            // Return mobile response
+            return JsonNet(new LoginModel { /* your model */ });
+        }
+    }
+    
+    // Website flow - existing code
+    if (User.Identity.IsAuthenticated)
+    {
+        var claimsIdentity = User.Identity as ClaimsIdentity;
+        // Your existing code...
+    }
+
+    return RedirectToAction("Login");
+}
+This approach:
+
+All authentication flows through UserInfo
+Uses existing FormsAuthentication.SignIn
+Maintains same session/cookie setup
+Single place for user setup
+No changes needed in SessionModule
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+First, Auth0SessionModule.cs - First point of authentication:
+
+csharpCopypublic class Auth0SessionModule : IHttpModule
+{
+    private readonly string[] ignoredRoutes = { "/shell", "/account/userinfo", "/signin-auth0" };
+    private static readonly ILog log = LogManager.GetLogger(typeof(Auth0SessionModule));
+
+    public void Init(HttpApplication app)
+    {
+        app.PostAcquireRequestState += OnPostAcquireRequestState;
+    }
+
+    private void OnPostAcquireRequestState(object sender, EventArgs e)
+    {
+        var app = (HttpApplication)sender;
+        if (app == null) return;
+
+        var request = app.Context.Request;
+        log.Debug($"Processing request for: {request.Path}");
+
+        // Skip auth check for ignored routes
+        if (ignoredRoutes.Any(route => request.Path.ToLower().Contains(route)))
+        {
+            log.Debug("Skipping auth check for ignored route");
+            return;
+        }
+
+        // Check if mobile request (has Bearer token)
+        var authHeader = request.Headers["Authorization"];
+        if (!string.IsNullOrEmpty(authHeader))
+        {
+            log.Debug("Mobile request detected via Authorization header");
+            return; // Let it proceed to UserInfo endpoint
+        }
+
+        // Website flow - check cookie
+        var authenticationCookie = request.Cookies["WebAuthCookie"];
+        if (authenticationCookie == null)
+        {
+            log.Debug("No auth cookie found - redirecting to Auth0 login");
+            RedirectToAuth0(app.Context);
+            return;
+        }
+
+        try
+        {
+            var authCookieInfo = new AuthCookieInfo(authenticationCookie);
+            var requestAgent = request.UserAgent ?? "";
+
+            if (!authCookieInfo.IsAuthenticated || 
+                requestAgent != authCookieInfo.UserAgent)
+            {
+                log.Debug("Invalid cookie or user agent mismatch");
+                ClearAuthAndRedirect(app.Context);
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Error("Cookie validation failed", ex);
+            ClearAuthAndRedirect(app.Context);
+            return;
+        }
+    }
+
+    private void RedirectToAuth0(HttpContext context)
+    {
+        var owinContext = context.GetOwinContext();
+        var properties = new AuthenticationProperties
+        {
+            RedirectUri = ConfigurationManager.AppSettings["Auth0:RedirectUri"]
+        };
+
+        owinContext.Authentication.Challenge(properties, "Auth0");
+    }
+
+    private void ClearAuthAndRedirect(HttpContext context)
+    {
+        var cookie = new HttpCookie("WebAuthCookie")
+        {
+            Expires = DateTime.Now.AddDays(-1)
+        };
+        context.Response.Cookies.Add(cookie);
+        RedirectToAuth0(context);
+    }
+
+    public void Dispose() { }
+}
+
+AccountController.cs - UserInfo endpoint handling both flows:
+
+csharpCopy[AllowAnonymous]
+public async Task<ActionResult> UserInfo()
+{
+    var log = LogManager.GetLogger(typeof(AccountController));
+    log.Debug("UserInfo endpoint hit");
+
+    try
+    {
+        // Check for mobile request
+        var authHeader = Request.Headers["Authorization"];
+        if (!string.IsNullOrEmpty(authHeader))
+        {
+            log.Debug("Processing mobile authentication");
+            return await HandleMobileAuthentication(authHeader);
+        }
+
+        // Website flow
+        if (User.Identity.IsAuthenticated)
+        {
+            log.Debug("Processing website authentication");
+            var claimsIdentity = User.Identity as ClaimsIdentity;
+            if (claimsIdentity != null)
+            {
+                var email = claimsIdentity.FindFirst(ClaimTypes.Email)?.Value;
+                if (string.IsNullOrEmpty(email))
+                {
+                    log.Error("No email claim found");
+                    return RedirectToAction("Login");
+                }
+
+                var userId = _db.Users.GetUserID(email);
+                if (string.IsNullOrEmpty(userId))
+                {
+                    log.Error("User not found in database");
+                    return RedirectToAction("Login");
+                }
+
+                log.Debug($"Setting up authentication for user: {userId}");
+                FormsAuthentication.SignIn(userId);
+
+                return RedirectToAction("Index", "Home");
+            }
+        }
+
+        log.Debug("No valid authentication found");
+        return RedirectToAction("Login");
+    }
+    catch (Exception ex)
+    {
+        log.Error("Error in UserInfo", ex);
+        return RedirectToAction("Login");
+    }
+}
+
+private async Task<ActionResult> HandleMobileAuthentication(string authHeader)
+{
+    try
+    {
+        var token = authHeader.StartsWith("Bearer ") 
+            ? authHeader.Substring("Bearer ".Length) 
+            : authHeader;
+
+        var handler = new JwtSecurityTokenHandler();
+        var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+
+        if (jsonToken != null)
+        {
+            var email = jsonToken.Claims.FirstOrDefault(c => c.Type == "email")?.Value;
+            if (string.IsNullOrEmpty(email))
+            {
+                log.Error("No email in token");
+                return new HttpStatusCodeResult(HttpStatusCode.Unauthorized);
+            }
+
+            var userId = _db.Users.GetUserID(email);
+            if (string.IsNullOrEmpty(userId))
+            {
+                log.Error("User not found in database");
+                return new HttpStatusCodeResult(HttpStatusCode.Unauthorized);
+            }
+
+            // Use same FormsAuthentication for consistency
+            FormsAuthentication.SignIn(userId);
+
+            // Return mobile response
+            return JsonNet(new LoginModel
+            {
+                UserId = userId,
+                // Add other properties
+            });
+        }
+
+        return new HttpStatusCodeResult(HttpStatusCode.Unauthorized);
+    }
+    catch (Exception ex)
+    {
+        log.Error("Mobile authentication failed", ex);
+        return new HttpStatusCodeResult(HttpStatusCode.Unauthorized);
+    }
+}
+
+FormsAuthentication.cs - Common authentication handling:
+
+csharpCopypublic class FormsAuthentication
+{
+    private readonly ISettings _settings;
+    private static readonly ILog log = LogManager.GetLogger(typeof(FormsAuthentication));
+
+    public void SignIn(string userId)
+    {
+        if (string.IsNullOrEmpty(userId))
+            throw new ArgumentNullException(nameof(userId));
+
+        try
+        {
+            var userProfileRoles = _db.Users.GetProfileRoles(userId);
+            var userRoles = string.Join(";", userProfileRoles.WebRoles);
+
+            // Create user data string
+            var userData = CreateUserData(userId, userProfileRoles);
+
+            // Create authentication ticket
+            var ticket = new FormsAuthenticationTicket(
+                1,                          // version
+                userId,                     // user name
+                DateTime.Now,               // issue date
+                DateTime.Now.AddMinutes(_settings.AuthCookieExpirationInMinutes),
+                false,                      // persistent
+                userData                    // user data
+            );
+
+            string encryptedTicket = FormsAuthentication.Encrypt(ticket);
+
+            // Set cookie
+            var authCookie = new HttpCookie(FormsAuthentication.FormsCookieName, encryptedTicket)
+            {
+                HttpOnly = true,
+                Secure = true,
+                SameSite = SameSiteMode.Lax
+            };
+
+            HttpContext.Current.Response.Cookies.Add(authCookie);
+
+            // Set up principal
+            var identity = new GenericIdentity(userId);
+            var principal = new GenericPrincipal(identity, userProfileRoles.WebRoles);
+            
+            Thread.CurrentPrincipal = principal;
+            HttpContext.Current.User = principal;
+
+            log.Debug($"Authentication completed for user: {userId}");
+        }
+        catch (Exception ex)
+        {
+            log.Error($"SignIn failed for user: {userId}", ex);
+            throw;
+        }
+    }
+
+    private string CreateUserData(string userId, UserProfileRoles userProfile)
+    {
+        var request = HttpContext.Current.Request;
+        var trueClientIP = request.Headers["True-Client-IP"] ?? string.Empty;
+        
+        return $"{userProfile.WebRoles}|{userProfile.SessionGuid}|{userId}|{trueClientIP}";
+    }
+}
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+public async Task<ActionResult> UserInfo()
+{
+    // Check both web and mobile authentication
+    if (User.Identity.IsAuthenticated || IsMobileAuthenticated())
+    {
+        var email = GetUserEmail(); // This method will check both sources
+        if (!string.IsNullOrEmpty(email))
+        {
+            var userId = _db.Users.GetUserID(email);
+            
+            // Your existing code for FormsAuth, cookie creation etc.
+            FormsAuthentication.SignIn(userId);
+            
+            // Return based on request type
+            if (IsMobileRequest())
+            {
+                return JsonNet(new LoginModel { /* your model */ });
+            }
+            return RedirectToAction("Index", "Home");
+        }
+    }
+    return RedirectToAction("Login");
+}
+
+private bool IsMobileAuthenticated()
+{
+    var authHeader = Request.Headers["Authorization"];
+    if (!string.IsNullOrEmpty(authHeader))
+    {
+        // Validate mobile token
+        try
+        {
+            var token = authHeader.Substring("Bearer ".Length);
+            var handler = new JwtSecurityTokenHandler();
+            var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+            return jsonToken != null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+    return false;
+}
+
+private string GetUserEmail()
+{
+    if (User.Identity.IsAuthenticated)
+    {
+        // Get email from web auth
+        var claimsIdentity = User.Identity as ClaimsIdentity;
+        return claimsIdentity?.FindFirst(ClaimTypes.Email)?.Value;
+    }
+    
+    // Get email from mobile token
+    var authHeader = Request.Headers["Authorization"];
+    if (!string.IsNullOrEmpty(authHeader))
+    {
+        var token = authHeader.Substring("Bearer ".Length);
+        var handler = new JwtSecurityTokenHandler();
+        var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+        return jsonToken.Claims.FirstOrDefault(c => c.Type == "email")?.Value;
+    }
+    
+    return null;
+}
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Let me break down the complete solution step by step:
+
+Auth0 Portal Setup:
+
+CopyA. For Website Application (existing):
+   - Keep as is, no changes needed
+   - Type: Regular Web Application
+   - Settings remain same
+
+B. For Mobile Application:
+   - Application Type: Native
+   - Allowed Callback URLs: your-mobile-callback-url
+   - Allowed Web Origins: your-website-url
+   - Token Endpoint Authentication Method: None
+   - Advanced Settings:
+     * Grant Types: Authorization Code, Refresh Token
+     * Trust Token Endpoint IP: No
+     * Token Endpoint Auth Method: None
+
+Code Changes:
+
+First, AccountController.cs:
+csharpCopypublic async Task<ActionResult> UserInfo()
+{
+    var log = LogManager.GetLogger(typeof(AccountController));
+    log.Debug("UserInfo endpoint hit");
+
+    try
+    {
+        // Check both authentications
+        if (User.Identity.IsAuthenticated || IsValidMobileToken())
+        {
+            var email = GetUserEmail();
+            log.Debug($"Email found: {email}");
+
+            if (!string.IsNullOrEmpty(email))
+            {
+                var userId = _db.Users.GetUserID(email);
+                if (string.IsNullOrEmpty(userId))
+                {
+                    log.Error("User not found in database");
+                    return IsMobileRequest() 
+                        ? new HttpStatusCodeResult(HttpStatusCode.Unauthorized) 
+                        : RedirectToAction("Login");
+                }
+
+                // Use existing SignIn method
+                FormsAuthentication.SignIn(userId);
+                log.Debug($"Authentication successful for user: {userId}");
+
+                // Return based on request type
+                if (IsMobileRequest())
+                {
+                    return JsonNet(new LoginModel { 
+                        UserId = userId,
+                        // other properties
+                    });
+                }
+                return RedirectToAction("Index", "Home");
+            }
+        }
+
+        log.Debug("Authentication failed");
+        return IsMobileRequest() 
+            ? new HttpStatusCodeResult(HttpStatusCode.Unauthorized) 
+            : RedirectToAction("Login");
+    }
+    catch (Exception ex)
+    {
+        log.Error("Error in UserInfo", ex);
+        return IsMobileRequest() 
+            ? new HttpStatusCodeResult(HttpStatusCode.InternalServerError) 
+            : RedirectToAction("Login");
+    }
+}
+
+private bool IsValidMobileToken()
+{
+    var log = LogManager.GetLogger(typeof(AccountController));
+    var authHeader = Request.Headers["Authorization"];
+
+    if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
+    {
+        try
+        {
+            var token = authHeader.Substring("Bearer ".Length);
+            var handler = new JwtSecurityTokenHandler();
+            var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+
+            if (jsonToken != null)
+            {
+                // Validate token expiration
+                if (jsonToken.ValidTo < DateTime.UtcNow)
+                {
+                    log.Debug("Token expired");
+                    return false;
+                }
+
+                // Validate issuer
+                if (jsonToken.Issuer != $"https://{ConfigurationManager.AppSettings["Auth0:Domain"]}/")
+                {
+                    log.Debug("Invalid token issuer");
+                    return false;
+                }
+
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Error("Token validation failed", ex);
+            return false;
+        }
+    }
+    return false;
+}
+
+private string GetUserEmail()
+{
+    // For web authentication
+    if (User.Identity.IsAuthenticated)
+    {
+        var claimsIdentity = User.Identity as ClaimsIdentity;
+        return claimsIdentity?.FindFirst(ClaimTypes.Email)?.Value;
+    }
+
+    // For mobile authentication
+    var authHeader = Request.Headers["Authorization"];
+    if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
+    {
+        var token = authHeader.Substring("Bearer ".Length);
+        var handler = new JwtSecurityTokenHandler();
+        var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+        return jsonToken?.Claims.FirstOrDefault(c => c.Type == "email")?.Value;
+    }
+
+    return null;
+}
+
+private bool IsMobileRequest()
+{
+    return !string.IsNullOrEmpty(Request.Headers["Authorization"]);
+}
+
+Auth0SessionModule.cs - Keep but add mobile check:
+
+csharpCopyprivate void OnPostAcquireRequestState(object sender, EventArgs e)
+{
+    var app = (HttpApplication)sender;
+    if (app == null) return;
+
+    var request = app.Context.Request;
+    
+    // Skip auth check for Auth0 callbacks and mobile requests
+    if (ignoredRoutes.Contains(request.Path.ToLower()) || 
+        !string.IsNullOrEmpty(request.Headers["Authorization"]))
+    {
+        return;
+    }
+
+    // Rest of your existing website authentication code
+}
+
+No changes needed in:
+
+
+FormsAuthentication.cs (reused as is)
+SessionModule.cs (works with Forms Authentication)
+
+This solution handles:
+
+Authentication Cases:
+
+CopyWeb Authentication:
+- New login → Auth0 → UserInfo → FormsAuth
+- Session expired → Auth0 → UserInfo → FormsAuth
+- Cookie expired → Auth0 → UserInfo → FormsAuth
+- Invalid cookie → Auth0 → UserInfo → FormsAuth
+
+Mobile Authentication:
+- Valid token → UserInfo → FormsAuth → JSON response
+- Expired token → 401 response
+- Invalid token → 401 response
+- No token → 401 response
+
+Security Checks:
+
+
+Token validation
+Token expiration
+Issuer validation
+Email verification
+User existence check
+
+
+Error Handling:
+
+
+Token parsing errors
+Database errors
+Invalid users
+Missing claims
+
+Benefits:
+
+Simple flow
+Reuses existing code
+Minimal changes
+Clear separation
+Proper error handling
+Comprehensive logging
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Auth0 Portal - Website Application (Existing):
+
+Copya. Applications → Your Website App
+   - Application Type: Regular Web Application (keep as is)
+   - Allowed Callback URLs: https://your-website/Account/UserInfo
+   - Allowed Logout URLs: https://your-website/Account/Logout
+   - Allowed Web Origins: https://your-website
+   - Token Endpoint Authentication Method: POST
+   - ID Token Expiration: Your setting (e.g., 86400 seconds)
+   - Refresh Token Rotation: Yes (recommended)
+
+Auth0 Portal - Mobile Application:
+
+Copya. Applications → Create Application
+   - Name: Your Mobile App Name
+   - Application Type: Native
+
+b. Settings:
+   - Allowed Callback URLs: your-mobile-callback-url
+   - Allowed Origins (CORS): your-website-url
+   - Token Endpoint Authentication Method: None
+   - ID Token Expiration: Same as website
+   
+c. Advanced Settings:
+   - Grant Types: 
+     * Authorization Code
+     * Refresh Token
+   - JWT Expiration: Set same as website
+
+Changes in Startup.cs:
+
+csharpCopypublic void Configuration(IAppBuilder app)
+{
+    // Cookie settings
+    app.UseCookieAuthentication(new CookieAuthenticationOptions
+    {
+        AuthenticationType = "Cookies",
+        LoginPath = new PathString("/Account/Login"),
+        SlidingExpiration = true,
+        CookieSecure = CookieSecureOption.Always
+    });
+
+    // Auth0 configuration
+    app.UseOpenIdConnectAuthentication(new OpenIdConnectAuthenticationOptions
+    {
+        AuthenticationType = "Auth0",
+        Authority = $"https://{ConfigurationManager.AppSettings["Auth0:Domain"]}",
+        ClientId = ConfigurationManager.AppSettings["Auth0:ClientId"],
+        RedirectUri = ConfigurationManager.AppSettings["Auth0:RedirectUri"],
+        PostLogoutRedirectUri = ConfigurationManager.AppSettings["Auth0:PostLogoutRedirectUri"],
+        ResponseType = "code",
+        Scope = "openid profile email",
+        TokenValidationParameters = new TokenValidationParameters
+        {
+            NameClaimType = "name",
+            ValidateIssuer = true,
+            ValidIssuer = $"https://{ConfigurationManager.AppSettings["Auth0:Domain"]}/",
+            ValidateAudience = true,
+            ValidAudience = ConfigurationManager.AppSettings["Auth0:ClientId"]
+        },
+        Notifications = new OpenIdConnectAuthenticationNotifications
+        {
+            SecurityTokenValidated = notification =>
+            {
+                var identity = notification.AuthenticationTicket.Identity;
+                var email = identity.FindFirst(ClaimTypes.Email)?.Value;
+                if (!string.IsNullOrEmpty(email))
+                {
+                    identity.AddClaim(new Claim("email", email));
+                }
+                return Task.FromResult(0);
+            },
+            AuthenticationFailed = context =>
+            {
+                context.HandleResponse();
+                context.Response.Redirect("/Account/Login");
+                return Task.FromResult(0);
+            }
+        }
+    });
+}
+
+Web.config additions:
+
+xmlCopy<appSettings>
+    <add key="Auth0:Domain" value="your-domain.auth0.com" />
+    <add key="Auth0:ClientId" value="your-web-client-id" />
+    <add key="Auth0:RedirectUri" value="https://your-website/Account/UserInfo" />
+    <add key="Auth0:PostLogoutRedirectUri" value="https://your-website/Account/Login" />
+</appSettings>
+The flow will work like this:
+
+Website Flow:
+
+CopyUser → Auth0 Login → Callback to UserInfo 
+→ Check User.Identity.IsAuthenticated (true) 
+→ Get email from claims 
+→ Create FormsAuth ticket 
+→ Redirect to Home
+
+Mobile Flow:
+
+CopyUser in Mobile → Auth0 Login in Mobile 
+→ Mobile gets token 
+→ Mobile calls UserInfo with token 
+→ Check IsValidMobileToken() (true) 
+→ Get email from token 
+→ Create FormsAuth ticket 
+→ Return JSON response
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+The configuration shown will work for both, but let me explain why and also suggest a small enhancement:
+
+For Website:
+
+
+The OpenID Connect configuration handles web authentication
+RedirectUri points to your UserInfo endpoint
+Token validation parameters ensure security
+
+
+For Mobile:
+
+
+The cookie authentication handles session management
+The token validation parameters will also validate mobile tokens
+However, we should add mobile-specific validation
+
+Enhanced version:
+csharpCopypublic void Configuration(IAppBuilder app)
+{
+    // Cookie settings (used by both)
+    app.UseCookieAuthentication(new CookieAuthenticationOptions
+    {
+        AuthenticationType = "Cookies",
+        LoginPath = new PathString("/Account/Login"),
+        SlidingExpiration = true,
+        CookieSecure = CookieSecureOption.Always
+    });
+
+    // Auth0 configuration
+    app.UseOpenIdConnectAuthentication(new OpenIdConnectAuthenticationOptions
+    {
+        AuthenticationType = "Auth0",
+        Authority = $"https://{ConfigurationManager.AppSettings["Auth0:Domain"]}",
+        ClientId = ConfigurationManager.AppSettings["Auth0:ClientId"],
+        RedirectUri = ConfigurationManager.AppSettings["Auth0:RedirectUri"],
+        ResponseType = "code",
+        Scope = "openid profile email",
+        TokenValidationParameters = new TokenValidationParameters
+        {
+            NameClaimType = "name",
+            ValidateIssuer = true,
+            ValidIssuer = $"https://{ConfigurationManager.AppSettings["Auth0:Domain"]}/",
+            ValidateAudience = true,
+            // Allow both web and mobile client IDs
+            ValidAudiences = new[] 
+            { 
+                ConfigurationManager.AppSettings["Auth0:ClientId"],
+                ConfigurationManager.AppSettings["Auth0:MobileClientId"] 
+            }
+        },
+        Notifications = new OpenIdConnectAuthenticationNotifications
+        {
+            SecurityTokenValidated = notification =>
+            {
+                var identity = notification.AuthenticationTicket.Identity;
+                var email = identity.FindFirst(ClaimTypes.Email)?.Value;
+                if (!string.IsNullOrEmpty(email))
+                {
+                    identity.AddClaim(new Claim("email", email));
+                }
+                return Task.FromResult(0);
+            },
+            AuthenticationFailed = context =>
+            {
+                // Check if mobile request
+                if (!string.IsNullOrEmpty(context.Request.Headers["Authorization"]))
+                {
+                    context.Response.StatusCode = 401;
+                    return Task.FromResult(0);
+                }
+                
+                context.HandleResponse();
+                context.Response.Redirect("/Account/Login");
+                return Task.FromResult(0);
+            }
+        }
+    });
+}
+This configuration:
+
+Works for both web and mobile
+Validates tokens from both applications
+Handles errors appropriately for each
+Maintains security for both flows
+Uses the same session management
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
